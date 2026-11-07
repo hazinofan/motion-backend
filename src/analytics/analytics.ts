@@ -4,10 +4,11 @@ import { Activity, PlannedWorkout, Goal, User } from '../db/entities.js';
 import type { AuthedRequest } from '../auth/auth.js';
 import { addDays, dateOnly, dayDifference, localToday } from '../core/validate.js';
 import { HabitsService } from '../habits/habits.js';
+import { TrainingService } from '../training/training.js';
 
 @Injectable()
 export class AnalyticsService {
- constructor(public readonly db:DataSource,private readonly habits:HabitsService) {}
+ constructor(public readonly db:DataSource,private readonly habits:HabitsService,private readonly training:TrainingService) {}
  async today(userId:string){const user=await this.db.getRepository(User).findOneByOrFail({id:userId});return localToday(user.timezone);}
  async overview(userId:string,from:string,to:string){
    dateOnly(from);dateOnly(to);
@@ -59,6 +60,8 @@ export class AnalyticsService {
  async dashboard(userId:string){
   const today=await this.today(userId);const dow=(new Date(`${today}T12:00:00Z`).getUTCDay()+6)%7;
   const monday=addDays(today,-dow);const year=today.slice(0,4);
+  // Materialize repeating workouts before the dashboard reads its upcoming schedule.
+  await Promise.all([this.training.materializeGymRoutine(userId,monday,addDays(today,14)),this.training.materializeRunningRoutine(userId,monday,addDays(today,14))]);
   const [week,all,plans,habits,goals]=await Promise.all([
     this.overview(userId,monday,today),
     this.db.getRepository(Activity).find({where:{userId,completed:true,date:Between(`${year}-01-01`,today)},order:{date:'DESC',createdAt:'DESC'}}),

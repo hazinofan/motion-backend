@@ -1,8 +1,8 @@
 import { BadRequestException, Body, Controller, Delete, Get, Injectable, NotFoundException, Param, Patch, Post, Query, Req } from '@nestjs/common';
 import { DataSource, Between, In, IsNull, LessThanOrEqual, MoreThanOrEqual } from 'typeorm';
-import { Activity, ActivityExercise, Exercise, PlannedWorkout, RunningRoutineItem, WorkoutTemplate } from '../db/entities.js';
+import { Activity, ActivityExercise, Exercise, PlannedWorkout, RunningRoutineItem, GymRoutineItem, RunningWeekChange, User, WorkoutTemplate } from '../db/entities.js';
 import type { AuthedRequest } from '../auth/auth.js';
-import { dateOnly, validate, day } from '../core/validate.js';
+import { addDays, dateOnly, localToday, validate, day } from '../core/validate.js';
 import { z } from 'zod';
 import { deleteStravaImage } from './strava-image.js';
 
@@ -22,7 +22,31 @@ const activityBase=z.object({
 });
 const activitySchema=activityBase.superRefine((a,ctx)=>{if(a.type==='RUN'&&(!a.distanceMeters||!a.durationSeconds))ctx.addIssue({code:'custom',message:'Runs require distance and duration',path:['distanceMeters']});});
 const planSchema=z.object({date:z.string().regex(day),title:z.string().trim().min(1).max(120),type:types,status:statuses.default('PLANNED'),notes:z.string().max(5000).nullable().optional()});
+const gymRoutineSchema=z.object({startDate:z.string().regex(day),items:z.array(z.object({weekday:z.coerce.number().int().min(0).max(6),title:z.string().trim().min(1).max(120),templateId:z.string().uuid().nullable().optional()})).max(7).refine(items=>new Set(items.map(i=>i.weekday)).size===items.length,{message:'Only one gym workout can be scheduled per day'})});
 const runningRoutineSchema=z.object({startDate:z.string().regex(day),items:z.array(z.object({weekday:z.coerce.number().int().min(0).max(6),title:z.string().trim().min(1).max(50),distanceLabel:z.string().trim().min(1).max(20),paceLabel:z.string().trim().min(1).max(12)})).min(1).max(7)});
+
+const weekChangeReasons=z.enum(['INJURY','ILLNESS','RECOVERY','SCHEDULE','TRAVEL','OTHER']);
+const weekChangeSchema=z.object({
+  weekStart:z.string().regex(day),reason:weekChangeReasons,
+  details:z.string().trim().max(500).optional().default(''),
+  items:z.array(z.object({
+    planId:z.string().uuid(),date:z.string().regex(day),
+    title:z.string().trim().min(1).max(100),
+    distanceLabel:z.union([z.literal(''),z.string().trim().regex(/^\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?$/, 'Use a distance such as 5 or 6-7').max(20)]),
+    paceLabel:z.union([z.literal(''),z.string().regex(/^\d{1,2}:[0-5]\d$/, 'Use pace as 5:30')]),
+    action:z.enum(['KEEP','SKIP']),
+  })).max(25),
+});
+function mondayOf(date:string) {return addDays(date,-( (utcDate(date).getUTCDay()+6)%7));}
+function targetsFor(plan:PlannedWorkout, routine?:RunningRoutineItem) {
+  const match=plan.notes?.match(/Target:\s*([\d.,]+(?:\s*[-–]\s*[\d.,]+)?)\s*km\s*at\s*(\d{1,2}:[0-5]\d)\s*\/km/i)
+    ||plan.title.match(/([\d.,]+(?:\s*[-–]\s*[\d.,]+)?)\s*km\s*[·•-]\s*(\d{1,2}:[0-5]\d)\s*\/km/i);
+  return {distanceLabel:routine?.distanceLabel||match?.[1]||'',paceLabel:routine?.paceLabel||match?.[2]||''};
+}
+function baseRunTitle(plan:PlannedWorkout) {
+  return plan.title.replace(/\s*[·•]\s*[\d.,]+(?:\s*[-–]\s*[\d.,]+)?\s*km\s*[·•]\s*\d{1,2}:[0-5]\d\s*\/km\s*$/i,'').trim()||'Run';
+}
+
 const templateSchema=z.object({name:z.string().trim().min(1).max(100),exercises:z.array(z.object({exerciseId:z.string().uuid(),sets:z.coerce.number().int().min(1).max(30),reps:z.coerce.number().int().min(1).max(100)})).max(35)});
 const exerciseSchema=z.object({name:z.string().trim().min(1).max(100),muscleGroup:z.string().min(1).max(70),equipment:z.string().max(100).nullable().optional()});
 function sortedActivity(a:Activity):Activity {
@@ -42,11 +66,59 @@ export class TrainingService {
    const count=await this.db.getRepository(Exercise).count({where:[{id:In(unique),userId:IsNull()},{id:In(unique),userId}]});
    if(count!==unique.length)throw new BadRequestException('Unknown or inaccessible exercise');
  }
+ async materializeGymRoutine(userId:string,from:string,to:string) {
+   const items=await this.db.getRepository(GymRoutineItem).find({where:{userId,active:true,startDate:LessThanOrEqual(to)}});
+   if(!items.length)return;
+   const ids=items.map(item=>item.id);
+   const existing=await this.db.getRepository(PlannedWorkout).find({
+     where:{userId,gymRoutineItemId:In(ids),gymRoutineWeekStart:Between(mondayOf(from),mondayOf(to))},
+     select:{gymRoutineItemId:true,gymRoutineWeekStart:true},
+   });
+   // A workout rescheduled within the same week must not reappear on its old day.
+   const existingWeeks=new Set(existing.map(plan=>`${plan.gymRoutineItemId}|${plan.gymRoutineWeekStart}`));
+   const plans:Partial<PlannedWorkout>[]=[];
+   for(const item of items){
+     const first=utcDate(item.startDate>from?item.startDate:from);
+     first.setUTCDate(first.getUTCDate()+((item.weekday-first.getUTCDay()+7)%7));
+     for(const cursor=new Date(first);dateString(cursor)<=to;cursor.setUTCDate(cursor.getUTCDate()+7)){
+       const date=dateString(cursor);
+       if(!existingWeeks.has(`${item.id}|${mondayOf(date)}`)){
+         plans.push({userId,date,title:item.title,type:'GYM',status:'PLANNED',
+           notes:'Weekly gym routine',gymRoutineItemId:item.id,gymRoutineWeekStart:mondayOf(date)});
+       }
+     }
+   }
+   if(plans.length)await this.db.getRepository(PlannedWorkout).save(plans,{chunk:100});
+ }
+ async replaceGymRoutine(userId:string,raw:unknown) {
+   const input=validate(gymRoutineSchema,raw);dateOnly(input.startDate);
+   const templateIds=[...new Set(input.items.map(item=>item.templateId).filter((x):x is string=>!!x))];
+   if(templateIds.length){
+     const count=await this.db.getRepository(WorkoutTemplate).count({where:{userId,id:In(templateIds)}});
+     if(count!==templateIds.length)throw new BadRequestException('One of the workout templates is no longer available');
+   }
+   return this.db.transaction(async em=>{
+     const repo=em.getRepository(GymRoutineItem);
+     const previous=await repo.findBy({userId,active:true});
+     if(previous.length){
+       // Keep completed, skipped and manually modified workouts. Only untouched
+       // future PLANNED rows are replaced when saving the recurring routine.
+       await em.getRepository(PlannedWorkout).delete({userId,gymRoutineItemId:In(previous.map(p=>p.id)),status:'PLANNED',date:MoreThanOrEqual(input.startDate)});
+       await repo.update({userId,active:true},{active:false});
+     }
+     return repo.save(input.items.map(item=>repo.create({...item,userId,templateId:item.templateId||null,startDate:input.startDate,active:true})));
+   });
+ }
  async materializeRunningRoutine(userId:string,from:string,to:string) {
    const routineRepo=this.db.getRepository(RunningRoutineItem);
    const items=await routineRepo.find({where:{userId,active:true,startDate:LessThanOrEqual(to)}});
    if(!items.length)return;
    const ids=items.map(item=>item.id);
+   // A changed week is intentionally NOT regenerated from the recurring routine.
+   const changeRecords=await this.db.getRepository(RunningWeekChange).find({
+     where:{userId,weekStart:Between(mondayOf(from),to)},select:{weekStart:true}
+   });
+   const lockedWeeks=new Set(changeRecords.map(change=>change.weekStart));
    const existing=await this.db.getRepository(PlannedWorkout).find({where:{userId,routineItemId:In(ids),date:Between(from,to)},select:{routineItemId:true,date:true}});
    const keys=new Set(existing.map(plan=>`${plan.routineItemId}|${plan.date}`));
    const plans:Partial<PlannedWorkout>[]=[];
@@ -55,7 +127,7 @@ export class TrainingService {
      first.setUTCDate(first.getUTCDate()+((item.weekday-first.getUTCDay()+7)%7));
      for(const cursor=new Date(first);dateString(cursor)<=to;cursor.setUTCDate(cursor.getUTCDate()+7)){
        const date=dateString(cursor),key=`${item.id}|${date}`;
-       if(!keys.has(key))plans.push({userId,date,title:`${item.title} · ${item.distanceLabel} km · ${item.paceLabel}/km`,type:'RUN',status:'PLANNED',notes:`Weekly running routine · Target: ${item.distanceLabel} km at ${item.paceLabel}/km`,routineItemId:item.id});
+       if(!lockedWeeks.has(mondayOf(date))&&!keys.has(key))plans.push({userId,date,title:`${item.title} · ${item.distanceLabel} km · ${item.paceLabel}/km`,type:'RUN',status:'PLANNED',notes:`Weekly running routine · Target: ${item.distanceLabel} km at ${item.paceLabel}/km`,routineItemId:item.id});
      }
    }
    if(plans.length)await this.db.getRepository(PlannedWorkout).save(plans,{chunk:100});
@@ -73,12 +145,92 @@ export class TrainingService {
      return repo.save(input.items.map(item=>repo.create({...item,userId,startDate:input.startDate,active:true})));
    });
  }
+
+ async currentRunningWeek(userId:string) {
+   const user=await this.db.getRepository(User).findOneByOrFail({id:userId});
+   const weekStart=mondayOf(localToday(user.timezone));
+   const weekEnd=addDays(weekStart,6);
+   await this.materializeRunningRoutine(userId,weekStart,weekEnd);
+   const plans=await this.db.getRepository(PlannedWorkout).find({
+     where:{userId,type:'RUN',date:Between(weekStart,weekEnd)},order:{date:'ASC',createdAt:'ASC'}
+   });
+   const routineIds=[...new Set(plans.map(p=>p.routineItemId).filter((id):id is string=>!!id))];
+   const routines=routineIds.length?await this.db.getRepository(RunningRoutineItem).findBy({userId,id:In(routineIds)}):[];
+   const routineById=new Map(routines.map(r=>[r.id,r]));
+   const linked=plans.length?await this.db.getRepository(Activity).find({where:{userId,planId:In(plans.map(p=>p.id))},select:{planId:true}}):[];
+   const protectedIds=new Set(linked.map(activity=>activity.planId));
+   return {weekStart,weekEnd,items:plans.map(plan=>({
+     planId:plan.id,date:plan.date,title:baseRunTitle(plan),status:plan.status,
+     ...targetsFor(plan,plan.routineItemId?routineById.get(plan.routineItemId):undefined),
+     editable:!protectedIds.has(plan.id)&&!['COMPLETED','PARTIAL','REST'].includes(plan.status),
+   }))};
+ }
+ async changeCurrentRunningWeek(userId:string,raw:unknown) {
+   const input=validate(weekChangeSchema,raw);
+   dateOnly(input.weekStart);
+   if(input.reason==='OTHER'&&!input.details)throw new BadRequestException('Please add a reason for Other');
+   const current=await this.currentRunningWeek(userId);
+   if(input.weekStart!==current.weekStart)throw new BadRequestException('This week has changed. Refresh and try again.');
+   const editable=current.items.filter(item=>item.editable);
+   const byId=new Map(input.items.map(item=>[item.planId,item]));
+   if(byId.size!==input.items.length||editable.length!==input.items.length||editable.some(item=>!byId.has(item.planId))) {
+     throw new BadRequestException('The weekly plan has changed. Refresh the plan and try again.');
+   }
+   const updates=editable.map(before=>{
+     const after=byId.get(before.planId)!;
+     dateOnly(after.date);
+     if(Boolean(after.distanceLabel)!==Boolean(after.paceLabel))throw new BadRequestException('Provide both distance and pace, or leave both blank');
+     if(after.date<current.weekStart||after.date>current.weekEnd)throw new BadRequestException('Every run must stay within this week');
+     return {before,after};
+   });
+   const changed=updates.filter(({before,after})=>
+     before.date!==after.date||before.title!==after.title||before.distanceLabel!==after.distanceLabel||before.paceLabel!==after.paceLabel||
+     (before.status==='SKIPPED'?'SKIP':'KEEP')!==after.action
+   );
+   if(!changed.length)throw new BadRequestException('Make at least one change before saving');
+   return this.db.transaction(async em=>{
+     const plans=em.getRepository(PlannedWorkout);
+     const report=em.getRepository(RunningWeekChange);
+     const IDs=editable.map(p=>p.planId);
+     // Lock all editable plans so a concurrent completion or edit cannot be overwritten.
+     const locked=IDs.length?await plans.createQueryBuilder('p').setLock('pessimistic_write')
+       .where('p.userId = :userId AND p.id IN (:...ids)',{userId,ids:IDs}).getMany():[];
+     if(locked.length!==IDs.length)throw new BadRequestException('Your week changed. Refresh and try again.');
+     if(IDs.length){
+       const existing=await em.getRepository(Activity).find({where:{userId,planId:In(IDs)}});
+       if(existing.length||locked.some(p=>!['PLANNED','SKIPPED'].includes(p.status)))throw new BadRequestException('A run was completed while editing. Refresh and try again.');
+     }
+     const records=updates.map(({before,after})=>({
+       planId:before.planId,
+       before:{date:before.date,title:before.title,status:before.status,distanceLabel:before.distanceLabel,paceLabel:before.paceLabel},
+       after:{date:after.date,title:after.title,status:after.action==='SKIP'?'SKIPPED':'PLANNED',distanceLabel:after.distanceLabel,paceLabel:after.paceLabel}
+     }));
+     const saved=await report.save(report.create({userId,weekStart:current.weekStart,reason:input.reason,details:input.details||null,
+       changes:records.filter(({before,after})=>JSON.stringify(before)!==JSON.stringify(after))}));
+     // Detach this week's plans from recurring items. Otherwise editing the standard
+     // routine later could delete them. Past and completed plans are untouched.
+     for(const {before,after} of updates){
+       const original=locked.find(p=>p.id===before.planId)!;
+       const targetChanged=before.title!==after.title||before.distanceLabel!==after.distanceLabel||before.paceLabel!==after.paceLabel;
+       const hasTargets=Boolean(after.distanceLabel&&after.paceLabel);
+       await plans.update({id:original.id,userId},{
+         date:after.date,
+         status:after.action==='SKIP'?'SKIPPED':'PLANNED',
+         title:targetChanged?(hasTargets?`${after.title} · ${after.distanceLabel} km · ${after.paceLabel}/km`:after.title):original.title,
+         notes:targetChanged?(hasTargets?`Weekly running adjustment · Target: ${after.distanceLabel} km at ${after.paceLabel}/km`:original.notes):original.notes,
+         routineItemId:null,
+       });
+     }
+     return saved;
+   });
+ }
+
  async createActivity(userId:string,raw:unknown) {
    const input=validate(activitySchema,raw);dateOnly(input.date);
    const exercises=input.exercises??[];
    await this.verifyExercises(userId,exercises.map(e=>e.exerciseId));
    if(input.planId){const p=await this.ownPlan(input.planId,userId);
-     if(p.status==='REST')throw new BadRequestException('Rest day cannot have a completed activity');
+     if(p.status==='REST'||p.status==='SKIPPED')throw new BadRequestException('Rest and skipped days cannot have completed activities');
      if(p.date!==input.date||p.type!==input.type)throw new BadRequestException('Activity date and type must match its planned session');
      if(await this.db.getRepository(Activity).existsBy({planId:input.planId}))throw new BadRequestException('This plan already has an activity');
    }
@@ -102,7 +254,7 @@ export class TrainingController {
  constructor(private readonly service:TrainingService,private readonly db:DataSource) {}
  @Get('calendar') async calendar(@Req() req:AuthedRequest,@Query('from') from?:string,@Query('to') to?:string){
    const start=dateOnly(from||'2026-01-01'),end=dateOnly(to||'2030-12-31');
-   await this.service.materializeRunningRoutine(req.authId,start,end);
+   await Promise.all([this.service.materializeRunningRoutine(req.authId,start,end),this.service.materializeGymRoutine(req.authId,start,end)]);
    const range=Between(start,end);
    const [plans,activities]=await Promise.all([
      this.db.getRepository(PlannedWorkout).find({where:{userId:req.authId,date:range},order:{date:'ASC'}}),
@@ -110,8 +262,31 @@ export class TrainingController {
    ]);
    return {plans,activities:activities.map(sortedActivity)};
  }
+ @Get('gym-routine') gymRoutine(@Req() req:AuthedRequest){
+   return this.db.getRepository(GymRoutineItem).find({where:{userId:req.authId,active:true},order:{weekday:'ASC'}});
+ }
+ @Post('gym-routine') saveGymRoutine(@Req() req:AuthedRequest,@Body() raw:unknown){
+   return this.service.replaceGymRoutine(req.authId,raw);
+ }
+ @Get('plans/:id/gym-prefill') async gymPrefill(@Req() req:AuthedRequest,@Param('id') id:string){
+   const plan=await this.service.ownPlan(id,req.authId);
+   if(plan.type!=='GYM')throw new BadRequestException('This is not a gym workout');
+   if(plan.status==='REST'||plan.status==='SKIPPED')throw new BadRequestException('This session is not scheduled for completion');
+   const logged=await this.db.getRepository(Activity).findOneBy({userId:req.authId,planId:id});
+   if(logged)return {planId:id,existingActivityId:logged.id};
+   const routine=plan.gymRoutineItemId?await this.db.getRepository(GymRoutineItem).findOneBy({id:plan.gymRoutineItemId,userId:req.authId}):null;
+   const template=routine?.templateId?await this.db.getRepository(WorkoutTemplate).findOne({where:{id:routine.templateId,userId:req.authId},relations:{exercises:true}}):null;
+   return {planId:id,title:plan.title,date:plan.date,templateId:template?.id||null,
+     exercises:template?.exercises.sort((a,b)=>a.position-b.position).map(e=>({exerciseId:e.exerciseId,sets:e.sets,reps:e.reps}))||[]};
+ }
  @Get('running-routine') runningRoutine(@Req() req:AuthedRequest){return this.db.getRepository(RunningRoutineItem).find({where:{userId:req.authId,active:true},order:{weekday:'ASC'}});}
  @Post('running-routine') saveRunningRoutine(@Req() req:AuthedRequest,@Body() raw:unknown){return this.service.replaceRunningRoutine(req.authId,raw);}
+ @Get('running/week-plan') weekPlan(@Req() req:AuthedRequest){return this.service.currentRunningWeek(req.authId);}
+ @Post('running/week-plan/change') changeWeekPlan(@Req() req:AuthedRequest,@Body() raw:unknown){return this.service.changeCurrentRunningWeek(req.authId,raw);}
+ @Get('running/week-plan/changes') weekPlanChanges(@Req() req:AuthedRequest){
+   return this.db.getRepository(RunningWeekChange).find({where:{userId:req.authId},order:{createdAt:'DESC'},take:30});
+ }
+
  /** Return the original routine targets when opening Log a run from the calendar.
   * The duration is only a target estimate, never claimed to be a measured run. */
  @Get('plans/:id/run-prefill') async runPrefill(@Req() req:AuthedRequest,@Param('id') id:string){
@@ -141,7 +316,7 @@ export class TrainingController {
  @Post('plans') createPlan(@Req() req:AuthedRequest,@Body() raw:unknown){const v=validate(planSchema,raw);dateOnly(v.date);const repo=this.db.getRepository(PlannedWorkout);if(v.status==='COMPLETED')throw new BadRequestException('Complete a plan by logging an activity');return repo.save(repo.create({...v,userId:req.authId}));}
  @Patch('plans/:id') async updatePlan(@Req() req:AuthedRequest,@Param('id') id:string,@Body() raw:unknown){const plan=await this.service.ownPlan(id,req.authId);const v=validate(planSchema.partial(),raw);if(v.status==='COMPLETED')throw new BadRequestException('Complete a planned workout using its Complete action');if(v.date)dateOnly(v.date);if(await this.db.getRepository(Activity).existsBy({planId:id})&&(v.date&&v.date!==plan.date||v.type&&v.type!==plan.type||v.status==='REST'))throw new BadRequestException('Cannot modify the date, type or rest status of a logged activity');return this.db.getRepository(PlannedWorkout).save(Object.assign(plan,v));}
  @Delete('plans/:id') async deletePlan(@Req() req:AuthedRequest,@Param('id') id:string){const p=await this.service.ownPlan(id,req.authId);await this.db.getRepository(PlannedWorkout).remove(p);return {ok:true};}
- @Post('plans/:id/complete') async completePlan(@Req() req:AuthedRequest,@Param('id') id:string){const p=await this.service.ownPlan(id,req.authId);if(p.status==='REST')throw new BadRequestException('Rest days cannot be completed');if(await this.db.getRepository(Activity).existsBy({planId:id}))throw new BadRequestException('Already logged: edit its activity instead');if(p.type==='RUN')throw new BadRequestException('A run requires distance and duration. Log it through the running form.');return this.service.createActivity(req.authId,{date:p.date,type:p.type,title:p.title,planId:id,completed:true,exercises:[]});}
+ @Post('plans/:id/complete') async completePlan(@Req() req:AuthedRequest,@Param('id') id:string){const p=await this.service.ownPlan(id,req.authId);if(p.status==='REST'||p.status==='SKIPPED')throw new BadRequestException('Rest and skipped sessions cannot be completed');if(await this.db.getRepository(Activity).existsBy({planId:id}))throw new BadRequestException('Already logged: edit its activity instead');if(p.type==='RUN')throw new BadRequestException('A run requires distance and duration. Log it through the running form.');return this.service.createActivity(req.authId,{date:p.date,type:p.type,title:p.title,planId:id,completed:true,exercises:[]});}
  @Get('exercises') exercises(@Req() req:AuthedRequest){return this.db.getRepository(Exercise).find({where:[{userId:IsNull()},{userId:req.authId}],order:{name:'ASC'}});}
  @Post('exercises') async createExercise(@Req() req:AuthedRequest,@Body() raw:unknown){const v=validate(exerciseSchema,raw);const repo=this.db.getRepository(Exercise);const existing=await repo.findOne({where:[{name:v.name,userId:IsNull()},{name:v.name,userId:req.authId}]});if(existing)throw new BadRequestException('Exercise already exists');return repo.save(repo.create({name:v.name,muscleGroup:v.muscleGroup,equipment:v.equipment??null,userId:req.authId}));}
  @Get('templates') async templates(@Req() req:AuthedRequest){const data=await this.db.getRepository(WorkoutTemplate).find({where:{userId:req.authId},relations:{exercises:{exercise:true}},order:{createdAt:'DESC'}});return data.map(t=>{t.exercises.sort((a,b)=>a.position-b.position);return t;});}

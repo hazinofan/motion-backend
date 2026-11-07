@@ -27,6 +27,7 @@ export class User {
 @Entity('plannedworkout')
 @Index(['userId','date'])
 @Index(['routineItemId','date'],{unique:true})
+@Index(['gymRoutineItemId','gymRoutineWeekStart'],{unique:true})
 export class PlannedWorkout {
   @PrimaryGeneratedColumn('uuid') id: string;
   @Column({type:'varchar',length:191}) userId:string;
@@ -38,9 +39,27 @@ export class PlannedWorkout {
   @Column({type:'text',nullable:true}) notes:string|null;
   @Column({type:'varchar',length:191,nullable:true}) routineItemId:string|null;
   @ManyToOne(()=>RunningRoutineItem,{onDelete:'SET NULL',nullable:true}) @JoinColumn({name:'routineItemId'}) routineItem?:RunningRoutineItem|null;
+  @Index() @Column({type:'varchar',length:191,nullable:true}) gymRoutineItemId:string|null;
+  @Column({type:'varchar',length:10,nullable:true}) gymRoutineWeekStart:string|null;
+  @ManyToOne(()=>GymRoutineItem,{onDelete:'SET NULL',nullable:true}) @JoinColumn({name:'gymRoutineItemId'}) gymRoutineItem?:GymRoutineItem|null;
   @OneToOne(()=>Activity,a=>a.plan) activity?:Activity|null;
   @CreateDateColumn({type:'datetime',precision:3,default:()=> 'CURRENT_TIMESTAMP(3)'}) createdAt:Date;
   @UpdateDateColumn({type:'datetime',precision:3,default:()=> 'CURRENT_TIMESTAMP(3)',onUpdate:'CURRENT_TIMESTAMP(3)'}) updatedAt:Date;
+}
+@Entity('gymroutineitem')
+@Index(['userId','active'])
+export class GymRoutineItem {
+  @PrimaryGeneratedColumn('uuid') id:string;
+  @Column({type:'varchar',length:191}) userId:string;
+  @ManyToOne(()=>User,{onDelete:'CASCADE'}) @JoinColumn({name:'userId'}) user:User;
+  @Column({type:'int'}) weekday:number;
+  @Column({type:'varchar',length:120}) title:string;
+  @Column({type:'varchar',length:191,nullable:true}) templateId:string|null;
+  @ManyToOne(()=>WorkoutTemplate,{onDelete:'SET NULL',nullable:true}) @JoinColumn({name:'templateId'}) template?:WorkoutTemplate|null;
+  @Column({type:'varchar',length:10}) startDate:string;
+  @Column({type:'boolean',default:true}) active:boolean;
+  @OneToMany(()=>PlannedWorkout,p=>p.gymRoutineItem) plans:PlannedWorkout[];
+  @CreateDateColumn({type:'datetime',precision:3,default:()=> 'CURRENT_TIMESTAMP(3)'}) createdAt:Date;
 }
 @Entity('runningroutineitem')
 @Index(['userId','active'])
@@ -56,6 +75,19 @@ export class RunningRoutineItem {
   @Column({type:'boolean',default:true}) active:boolean;
   @OneToMany(()=>PlannedWorkout,p=>p.routineItem) plans:PlannedWorkout[];
   @CreateDateColumn({type:'datetime',precision:3,default:()=> 'CURRENT_TIMESTAMP(3)'}) createdAt:Date;
+}
+/** One audit record per weekly-plan edit. It also prevents recurrence regeneration for that week. */
+@Entity('runningweekchange')
+@Index('IDX_runningweekchange_user_week',['userId', 'weekStart'])
+export class RunningWeekChange {
+  @PrimaryGeneratedColumn('uuid') id: string;
+  @Column({type:'varchar',length:191}) userId: string;
+  @ManyToOne(()=>User,{onDelete:'CASCADE'}) @JoinColumn({name:'userId'}) user: User;
+  @Column({type:'varchar',length:10}) weekStart: string;
+  @Column({type:'varchar',length:30}) reason: string;
+  @Column({type:'varchar',length:500,nullable:true}) details: string|null;
+  @Column({type:'json'}) changes: Record<string,unknown>[];
+  @CreateDateColumn({type:'datetime',precision:3,default:()=> 'CURRENT_TIMESTAMP(3)'}) createdAt: Date;
 }
 @Entity('activity')
 @Index(['userId','date'])
@@ -188,4 +220,4 @@ export class ShareLink {
   @CreateDateColumn({type:'datetime',precision:3,default:()=> 'CURRENT_TIMESTAMP(3)'}) createdAt:Date;
   @Column({type:'datetime',precision:3,nullable:true}) expiresAt:Date|null;
 }
-export const ENTITIES = [User,PlannedWorkout,RunningRoutineItem,Activity,Exercise,WorkoutTemplate,TemplateExercise,ActivityExercise,GymSet,Habit,HabitCheckin,Goal,ShareLink];
+export const ENTITIES = [User,PlannedWorkout,RunningRoutineItem,GymRoutineItem,RunningWeekChange,Activity,Exercise,WorkoutTemplate,TemplateExercise,ActivityExercise,GymSet,Habit,HabitCheckin,Goal,ShareLink];
